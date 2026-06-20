@@ -187,6 +187,167 @@ Write a brief professional summary (2-4 sentences). If there are failures, menti
     except Exception as e:
         logger.error(f"Execution summary error: {e}")
         return f"Execution complete: {len(completed_tasks)} succeeded, {len(failed_tasks)} failed."
+async def generate_reboot_scripts(
+    server_hostname: str,
+    kb_document: str,
+    server_state: dict = None,
+) -> dict:
+    """
+    Agent 2: Read the server's KB document (plain English) and generate
+    custom pre-reboot and post-reboot PowerShell scripts.
+    Returns: {pre_reboot_script, post_reboot_script, reasoning, apps_identified}
+    """
+    state_context = ""
+    if server_state:
+        state_context = f"""
+Current server state:
+- Running services: {server_state.get('Services', 'unknown')}
+- OS: {server_state.get('OS', 'unknown')}
+- Uptime hours: {server_state.get('Uptime', 'unknown')}
+"""
+
+    prompt = f"""You are a Windows PowerShell expert and IT operations engineer.
+You need to generate safe, production-ready PowerShell scripts for a Windows server reboot operation.
+
+Server: {server_hostname}
+{state_context}
+
+Server Knowledge Base Document (written by the operations team):
+---
+{kb_document}
+---
+
+Based on the knowledge base document above, generate TWO PowerShell scripts:
+
+1. PRE_REBOOT_SCRIPT: Run BEFORE the server reboots
+   - Gracefully stop/drain applications that need it
+   - Respect any "never stop" rules
+   - Follow any ordering rules (stop A before B)
+   - Log each action with Write-Output
+   - Exit 0 on success, Exit 1 on failure
+
+2. POST_REBOOT_SCRIPT: Run AFTER the server comes back online
+   - Start applications in the correct order
+   - Wait for each to be healthy before starting the next
+   - Perform health checks as described
+   - Log each action with Write-Output
+   - Exit 0 on success, Exit 1 on failure
+
+IMPORTANT RULES:
+- Never stop Windows security software (Defender, CrowdStrike, etc.)
+- Never stop the WinRM service itself
+- Always use try/catch for error handling
+- Always use Write-Output (not Write-Host) so PatchOps can capture logs
+- Keep scripts focused and safe — if something is unclear, skip it with a comment
+- Use Start-Sleep between steps where the KB mentions wait times
+
+Respond ONLY with a JSON object (no markdown):
+{{
+  "pre_reboot_script": "# Full PowerShell script here\\n...",
+  "post_reboot_script": "# Full PowerShell script here\\n...",
+  "apps_identified": ["list of applications found in the KB document"],
+  "reasoning": "brief explanation of what the scripts do and why",
+  "warnings": ["any concerns or things the scripts cannot handle"]
+}}"""
+
+    try:
+        model = _get_model(settings.GEMINI_MODEL_AGENT)
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        result = json.loads(text.strip())
+        return result
+    except Exception as e:
+        logger.error(f"Script generation error: {e}")
+        # Fallback: generic safe scripts
+        return {
+            "pre_reboot_script": f"# Auto-generated pre-reboot script for {server_hostname}\n# KB document parsing failed — using safe defaults\nWrite-Output 'Pre-reboot check: No custom actions configured'\nWrite-Output 'Server is ready for reboot'\nexit 0",
+            "post_reboot_script": f"# Auto-generated post-reboot script for {server_hostname}\n# KB document parsing failed — using safe defaults\nWrite-Output 'Post-reboot check: Verifying Windows services...'\n$autoServices = Get-Service | Where-Object {{$_.StartType -eq 'Automatic' -and $_.Status -ne 'Running'}}\nforeach ($svc in $autoServices) {{\n    Write-Output \"Starting: $($svc.Name)\"\n    Start-Service $svc.Name -ErrorAction SilentlyContinue\n}}\nWrite-Output 'Post-reboot startup complete'\nexit 0",
+            "apps_identified": [],
+            "reasoning": "Fallback scripts used — Gemini unavailable",
+            "warnings": ["Using generic fallback scripts. Add a valid Gemini API key for custom script generation."],
+        }
+async def generate_reboot_scripts(
+    server_hostname: str,
+    kb_document: str,
+    server_state: dict = None,
+) -> dict:
+    """
+    Read the server's KB document (plain English) and generate
+    custom pre-reboot and post-reboot PowerShell scripts via Gemini.
+    """
+    state_context = ""
+    if server_state:
+        state_context = f"""
+Current server state:
+- Running services: {server_state.get('Services', 'unknown')}
+- OS: {server_state.get('OS', 'unknown')}
+- Uptime hours: {server_state.get('Uptime', 'unknown')}
+"""
+
+    prompt = f"""You are a Windows PowerShell expert and IT operations engineer.
+Generate safe, production-ready PowerShell scripts for a Windows server reboot operation.
+
+Server: {server_hostname}
+{state_context}
+
+Server Knowledge Base Document:
+---
+{kb_document}
+---
+
+Generate TWO PowerShell scripts:
+
+1. PRE_REBOOT_SCRIPT: Run BEFORE the server reboots
+   - Gracefully stop applications that need it per the KB document
+   - Respect any never-stop rules
+   - Log each action with Write-Output
+   - Exit 0 on success, Exit 1 on failure
+
+2. POST_REBOOT_SCRIPT: Run AFTER the server comes back online
+   - Start applications in the correct order per the KB document
+   - Wait for each to be healthy before proceeding
+   - Log each action with Write-Output
+   - Exit 0 on success, Exit 1 on failure
+
+IMPORTANT RULES:
+- Never stop Windows Defender, CrowdStrike, or any security software
+- Never stop the WinRM service itself
+- Never stop WindowsAzureGuestAgent or Azure monitoring agents
+- Always use Write-Output (not Write-Host) so PatchOps can capture logs
+- Always wrap in try/catch blocks
+
+Respond ONLY with a JSON object (no markdown fences):
+{{
+  "pre_reboot_script": "# Full PowerShell script\\n...",
+  "post_reboot_script": "# Full PowerShell script\\n...",
+  "apps_identified": ["list of apps found in KB"],
+  "reasoning": "brief explanation of what scripts do",
+  "warnings": ["any concerns"]
+}}"""
+
+    try:
+        model = _get_model(settings.GEMINI_MODEL_AGENT)
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        result = json.loads(text.strip())
+        return result
+    except Exception as e:
+        logger.error(f"Script generation error: {e}")
+        return {
+            "pre_reboot_script": f"# Pre-reboot script for {server_hostname}\nWrite-Output 'No custom pre-reboot actions configured'\nexit 0",
+            "post_reboot_script": f"# Post-reboot script for {server_hostname}\nWrite-Output 'No custom post-reboot actions configured'\nexit 0",
+            "apps_identified": [],
+            "reasoning": f"Fallback scripts used — error: {str(e)}",
+            "warnings": ["Using fallback scripts. Check Gemini API key."],
+        }
 
 
 async def run_rca_analysis(

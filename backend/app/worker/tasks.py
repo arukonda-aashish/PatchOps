@@ -13,12 +13,14 @@ import random
 from datetime import datetime, timezone
 from typing import Optional
 import openpyxl
+import hashlib
 from io import BytesIO
 import networkx as nx
 from sqlalchemy import select
 
 from app.worker.celery_app import celery_app
 from app.db.session import AsyncSessionLocal
+from sqlalchemy.pool import NullPool
 from app.models.change_request import ChangeRequest, CRStatus, ServerTask, TaskStatus
 from app.models.agent_run import AgentRun, AgentLog, AgentType, AgentRunStatus
 from app.models.knowledge import DependencyEdge, ScheduledRebootWindow, ServicePauseConfig
@@ -31,20 +33,27 @@ logger = logging.getLogger(__name__)
 
 
 def run_async(coro):
-    """Run async coroutine in Celery sync context"""
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    """Run async coroutine in Celery sync context.
+    Creates a fresh event loop per task — asyncpg connections must not be
+    reused across loops, so AsyncSessionLocal is scoped inside each coro.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
+    except Exception as e:
+        raise
     finally:
-        loop.close()
-        asyncio.set_event_loop(None)
+        try:
+            # Cancel all pending tasks before closing
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
 
 
 async def _log(db, cr_id: int, run_id: Optional[int], agent_type: str,
@@ -152,7 +161,7 @@ async def _run_baseline_agent(cr_id: int):
                        "📎 Fetching server list from ServiceNow attachment...")
             await db.commit()
 
-            server_list = await _fetch_server_list(cr)
+            server_list, server_ip_map = await _fetch_server_list(cr)
 
             await _log(db, cr_id, run_id, "baseline", "INFO",
                        f"✅ Found {len(server_list)} servers: {', '.join(server_list)}")
@@ -218,7 +227,9 @@ async def _run_baseline_agent(cr_id: int):
             # Check server timezones (we detect at runtime from mock/winrm)
             server_tz_map = {}
             for srv in server_list:
-                state = await winrm_service.get_server_state(srv)
+                state = await winrm_service.get_server_state(
+                    srv, ip_address=server_ip_map.get(srv)
+                )
                 tz = state.get("Timezone", "UTC")
                 server_tz_map[srv] = tz
 
@@ -256,6 +267,7 @@ async def _run_baseline_agent(cr_id: int):
                 "dependency_notes": dep_notes,
                 "pause_servers": list(pause_configs.keys()),
                 "server_timezones": server_tz_map,
+                "server_ip_map": server_ip_map,
                 "reasoning": [
                     f"Topological sort resolved {len(edges)} dependency edges",
                     f"Servers in same bucket execute in parallel (max {settings.MAX_PARALLEL_REBOOTS})",
@@ -297,6 +309,66 @@ async def _run_baseline_agent(cr_id: int):
             cr.status = CRStatus.failed
             await db.commit()
 
+            
+async def _get_kb_pre_reboot_script(hostname: str, server_state: dict = None) -> Optional[str]:
+    """Fetch KB document for server and generate pre-reboot PS1 via Gemini.
+    Returns None if no KB document exists for this server.
+    """
+    import requests as _requests
+    from app.core.config import settings as _settings
+    try:
+        async with AsyncSessionLocal() as db:
+            from app.models.knowledge import ServerKBDocument
+            result = await db.execute(
+                select(ServerKBDocument).where(
+                    ServerKBDocument.server_hostname == hostname,
+                    ServerKBDocument.is_active == True,
+                )
+            )
+            doc = result.scalar_one_or_none()
+            if not doc:
+                return None
+
+            scripts = await gemini_service.generate_reboot_scripts(
+                server_hostname=hostname,
+                kb_document=doc.document_content,
+                server_state=server_state,
+            )
+            # Cache scripts back to DB
+            doc.last_pre_reboot_script = scripts["pre_reboot_script"]
+            doc.last_post_reboot_script = scripts["post_reboot_script"]
+            doc.last_script_generated_at = datetime.now(timezone.utc)
+            await db.commit()
+            logger.info(f"KB pre-reboot script generated for {hostname}: {scripts.get('apps_identified', [])}")
+            return scripts["pre_reboot_script"]
+    except Exception as e:
+        logger.error(f"Failed to get KB pre-reboot script for {hostname}: {e}")
+        return None
+
+
+async def _get_kb_post_reboot_script(hostname: str) -> Optional[str]:
+    """Fetch cached post-reboot script for server (generated during pre-reboot phase).
+    Returns None if no KB document exists.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            from app.models.knowledge import ServerKBDocument
+            result = await db.execute(
+                select(ServerKBDocument).where(
+                    ServerKBDocument.server_hostname == hostname,
+                    ServerKBDocument.is_active == True,
+                )
+            )
+            doc = result.scalar_one_or_none()
+            if not doc or not doc.last_post_reboot_script:
+                return None
+            return doc.last_post_reboot_script
+    except Exception as e:
+        logger.error(f"Failed to get KB post-reboot script for {hostname}: {e}")
+        return None
+
+
+
 
 def _build_buckets(ordered: list, G: nx.DiGraph) -> list[list[str]]:
     """
@@ -331,9 +403,10 @@ def _build_buckets(ordered: list, G: nx.DiGraph) -> list[list[str]]:
     return buckets
 
 
-async def _fetch_server_list(cr: ChangeRequest) -> list[str]:
+async def _fetch_server_list(cr: ChangeRequest) -> tuple[list[str], dict[str, str]]:
     """
     Fetch server list from ServiceNow attachment.
+    Returns (hostnames, hostname→ip map).
     Falls back to mock list if SN is unavailable or in mock mode.
     """
     # Try real ServiceNow attachment
@@ -371,7 +444,7 @@ async def _fetch_server_list(cr: ChangeRequest) -> list[str]:
                 if fname.endswith(".xlsx"):
                     return _parse_server_list_xlsx(content)
                 elif fname.endswith((".txt", ".csv", ".json")):
-                    return _parse_server_list(content.decode("utf-8"))
+                    return _parse_server_list(content.decode("utf-8")), {}
         except Exception as e:
             logger.error(f"Failed to fetch SN attachment: {e}")
     # Mock server list for demo
@@ -379,30 +452,35 @@ async def _fetch_server_list(cr: ChangeRequest) -> list[str]:
         "srv-db-01", "srv-db-02", "srv-app-01", "srv-app-02", "srv-app-03",
         "srv-web-01", "srv-web-02", "srv-cache-01", "srv-mq-01",
     ]
-    # Deterministic subset based on CR number
-    import hashlib
     seed = int(hashlib.md5(cr.cr_number.encode()).hexdigest()[:8], 16)
     rng = random.Random(seed)
     count = rng.randint(4, len(base_servers))
-    return rng.sample(base_servers, count)
+    return rng.sample(base_servers, count), {}
 
-def _parse_server_list_xlsx(content: bytes) -> list[str]:
-    """Parse server list from Excel attachment — reads first column of first sheet"""
+def _parse_server_list_xlsx(content: bytes) -> tuple[list[str], dict[str, str]]:
+    """Parse server list from Excel — reads hostname (col1) and optional ip_address (col2).
+    Returns (hostnames, hostname→ip map).
+    """
     try:
-        
         wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
         ws = wb.active
         servers = []
+        ip_map = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
             val = row[0] if row else None
-            if val and isinstance(val, str):
-                srv = val.strip().lower()
-                if srv and not srv.startswith("#"):
-                    servers.append(srv)
-        return list(dict.fromkeys(servers))
+            if not val or not isinstance(val, str):
+                continue
+            srv = val.strip().lower()
+            if not srv or srv.startswith("#"):
+                continue
+            servers.append(srv)
+            # Second column is ip_address (optional)
+            if len(row) > 1 and row[1]:
+                ip_map[srv] = str(row[1]).strip()
+        return list(dict.fromkeys(servers)), ip_map
     except Exception as e:
         logger.error(f"Failed to parse xlsx attachment: {e}")
-        return []
+        return [], {}
 def _parse_server_list(content: str) -> list[str]:
     """Parse newline/comma-separated server list from attachment"""
     servers = []
@@ -454,7 +532,7 @@ async def _run_execution_agent(cr_id: int):
 
             for bucket_idx, bucket in enumerate(buckets):
                 await _log(db, cr_id, run_id, "execution", "INFO",
-                           f"📦 Processing Bucket {bucket_idx + 1}/{len(buckets)}: {', '.join(bucket)}")
+                           f" Processing Bucket {bucket_idx + 1}/{len(buckets)}: {', '.join(bucket)}")
                 await db.commit()
 
                 # Run all servers in bucket in parallel
@@ -468,11 +546,11 @@ async def _run_execution_agent(cr_id: int):
                     if isinstance(result, Exception) or not result.get("success"):
                         failed_tasks.append({"hostname": hostname, "error": str(result)})
                         await _log(db, cr_id, run_id, "execution", "ERROR",
-                                   f"❌ {hostname} failed", server=hostname)
+                                   f" {hostname} failed", server=hostname)
                     else:
                         completed_tasks.append({"hostname": hostname})
                         await _log(db, cr_id, run_id, "execution", "SUCCESS",
-                                   f"✅ {hostname} rebooted successfully", server=hostname)
+                                   f" {hostname} rebooted successfully", server=hostname)
 
                 # Update progress
                 total = cr.total_servers or len([s for b in buckets for s in b])
@@ -483,12 +561,12 @@ async def _run_execution_agent(cr_id: int):
                 await db.commit()
 
                 await _log(db, cr_id, run_id, "execution", "INFO",
-                           f"📊 Bucket {bucket_idx + 1} complete — Progress: {cr.progress_percent:.1f}%")
+                           f" Bucket {bucket_idx + 1} complete — Progress: {cr.progress_percent:.1f}%")
                 await db.commit()
 
             # ── Generate execution summary ─────────────────────────────────
             await _log(db, cr_id, run_id, "execution", "INFO",
-                       "✨ Generating execution summary...")
+                       " Generating execution summary...")
             await db.commit()
 
             summary = await gemini_service.generate_execution_summary(completed_tasks, failed_tasks)
@@ -504,7 +582,7 @@ async def _run_execution_agent(cr_id: int):
             await db.commit()
 
             await _log(db, cr_id, run_id, "execution", "SUCCESS",
-                       f"✅ Execution complete — {len(completed_tasks)} succeeded, {len(failed_tasks)} failed. Review summary to proceed.")
+                       f" Execution complete — {len(completed_tasks)} succeeded, {len(failed_tasks)} failed. Review summary to proceed.")
             await db.commit()
 
             # Auto-trigger validation after execution
@@ -512,7 +590,7 @@ async def _run_execution_agent(cr_id: int):
 
         except Exception as e:
             logger.error(f"Execution agent error: {e}", exc_info=True)
-            await _log(db, cr_id, run_id, "execution", "ERROR", f"❌ Execution agent error: {e}")
+            await _log(db, cr_id, run_id, "execution", "ERROR", f" Execution agent error: {e}")
             run.status = AgentRunStatus.failed
             run.error = str(e)
             cr.status = CRStatus.failed
@@ -522,12 +600,15 @@ async def _run_execution_agent(cr_id: int):
 async def _reboot_server(db, cr: ChangeRequest, run_id: int, hostname: str,
                           bucket_idx: int, needs_pause: bool) -> dict:
     """Execute full reboot sequence for one server"""
-    # Collect pre-state
+    # Resolve IP address from plan — Azure VMs need IP not hostname
+    ip_address = (cr.ordered_server_list or {}).get("server_ip_map", {}).get(hostname)
+
     await _log(db, cr.id, run_id, "execution", "INFO",
-               f"📊 Collecting pre-reboot state for {hostname}", server=hostname)
+               f"Collecting pre-reboot state for {hostname}" +
+               (f" ({ip_address})" if ip_address else ""), server=hostname)
     await db.commit()
 
-    pre_state = await winrm_service.get_server_state(hostname)
+    pre_state = await winrm_service.get_server_state(hostname, ip_address=ip_address)
 
     # Store pre-state in ServerTask
     task_result = await db.execute(
@@ -551,14 +632,36 @@ async def _reboot_server(db, cr: ChangeRequest, run_id: int, hostname: str,
     await db.commit()
 
     # Pause service if required
-    if needs_pause:
+    # Run KB-generated pre-reboot script if available, else fall back to service pause
+    kb_script = await _get_kb_pre_reboot_script(hostname, pre_state)
+    if kb_script:
+        await _log(db, cr.id, run_id, "execution", "INFO",
+                   f"📋 Running KB-generated pre-reboot script on {hostname}", server=hostname)
+        await db.commit()
+        kb_result = await winrm_service.execute_script(hostname, kb_script, ip_address=ip_address)
+        # Stream each line of output to live logs
+        for line in kb_result.stdout.splitlines():
+            if line.strip():
+                await _log(db, cr.id, run_id, "execution", "INFO", line.strip(), server=hostname)
+        await db.commit()
+        if not kb_result.success:
+            await _log(db, cr.id, run_id, "execution", "WARNING",
+                       f"⚠️ Pre-reboot script had errors on {hostname}: {kb_result.stderr[:200]}",
+                       server=hostname)
+            await db.commit()
+        else:
+            if task:
+                task.service_paused_at = datetime.now(timezone.utc)
+                await db.flush()
+                await db.commit()
+    elif needs_pause:
         await _log(db, cr.id, run_id, "execution", "INFO",
                    f"⏸️ Pausing service on {hostname}", server=hostname)
         await db.commit()
-
         pause_result = await winrm_service.execute_script(
             hostname,
             f"& C:\\PatchOps\\Pause-Service.ps1",
+            ip_address=ip_address,
         )
         if not pause_result.success:
             await _log(db, cr.id, run_id, "execution", "WARNING",
@@ -573,10 +676,10 @@ async def _reboot_server(db, cr: ChangeRequest, run_id: int, hostname: str,
 
     # Initiate reboot
     await _log(db, cr.id, run_id, "execution", "INFO",
-               f"🔄 Initiating reboot on {hostname}", server=hostname)
+               f" Initiating reboot on {hostname}", server=hostname)
     await db.commit()
 
-    reboot_result = await winrm_service.initiate_reboot(hostname)
+    reboot_result = await winrm_service.initiate_reboot(hostname, ip_address=ip_address)
     if not reboot_result.success:
         if task:
             task.status = TaskStatus.failed
@@ -588,10 +691,10 @@ async def _reboot_server(db, cr: ChangeRequest, run_id: int, hostname: str,
 
     # Wait for server to come back
     await _log(db, cr.id, run_id, "execution", "INFO",
-               f"⏳ Waiting for {hostname} to come back online...", server=hostname)
+               f" Waiting for {hostname} to come back online...", server=hostname)
     await db.commit()
 
-    came_back = await winrm_service.wait_for_reboot(hostname, timeout=settings.REBOOT_TIMEOUT_SECONDS)
+    came_back = await winrm_service.wait_for_reboot(hostname, timeout=settings.REBOOT_TIMEOUT_SECONDS, ip_address=ip_address)
     if not came_back:
         if task:
             task.status = TaskStatus.failed
@@ -601,15 +704,34 @@ async def _reboot_server(db, cr: ChangeRequest, run_id: int, hostname: str,
             await db.commit()
         return {"success": False, "hostname": hostname, "error": "Reboot timeout"}
 
-    # Resume service if it was paused
-    if needs_pause:
+ 
+    # Run KB-generated post-reboot script if available, else fall back to service resume
+    kb_post_script = await _get_kb_post_reboot_script(hostname)
+    if kb_post_script:
+        await _log(db, cr.id, run_id, "execution", "INFO",
+                   f"📋 Running KB-generated post-reboot script on {hostname}", server=hostname)
+        await db.commit()
+        kb_post_result = await winrm_service.execute_script(hostname, kb_post_script, ip_address=ip_address)
+        for line in kb_post_result.stdout.splitlines():
+            if line.strip():
+                await _log(db, cr.id, run_id, "execution", "INFO", line.strip(), server=hostname)
+        await db.commit()
+        if not kb_post_result.success:
+            await _log(db, cr.id, run_id, "execution", "WARNING",
+                       f"⚠️ Post-reboot script had errors on {hostname}: {kb_post_result.stderr[:200]}",
+                       server=hostname)
+        else:
+            if task:
+                task.service_resumed_at = datetime.now(timezone.utc)
+                await db.flush()
+    elif needs_pause:
         await _log(db, cr.id, run_id, "execution", "INFO",
                    f"▶️ Resuming service on {hostname}", server=hostname)
         await db.commit()
-
         resume_result = await winrm_service.execute_script(
             hostname,
             f"& C:\\PatchOps\\Resume-Service.ps1",
+            ip_address=ip_address,
         )
         if not resume_result.success:
             await _log(db, cr.id, run_id, "execution", "WARNING",
@@ -670,7 +792,8 @@ async def _run_validation_agent(cr_id: int):
                            f"🔍 Checking {hostname}...", server=hostname)
                 await db.commit()
 
-                post_state = await winrm_service.get_server_state(hostname)
+                ip_address = (cr.ordered_server_list or {}).get("server_ip_map", {}).get(hostname)
+                post_state = await winrm_service.get_server_state(hostname, ip_address=ip_address)
                 pre_state = task.pre_state or {}
 
                 # Compare pre/post states
@@ -695,10 +818,10 @@ async def _run_validation_agent(cr_id: int):
 
                 if health_ok:
                     await _log(db, cr_id, run_id, "validation", "SUCCESS",
-                               f"✅ {hostname} healthy — deviation: {deviation:.1f}%", server=hostname)
+                               f" {hostname} healthy — deviation: {deviation:.1f}%", server=hostname)
                 else:
                     await _log(db, cr_id, run_id, "validation", "ERROR",
-                               f"❌ {hostname} unhealthy — deviation: {deviation:.1f}% (threshold: {settings.DEVIATION_THRESHOLD_PERCENT}%)",
+                               f" {hostname} unhealthy — deviation: {deviation:.1f}% (threshold: {settings.DEVIATION_THRESHOLD_PERCENT}%)",
                                server=hostname)
                     failed_servers.append({
                         "hostname": hostname,
@@ -729,7 +852,7 @@ async def _run_validation_agent(cr_id: int):
             await db.commit()
 
             await _log(db, cr_id, run_id, "validation", "SUCCESS" if all_healthy else "WARNING",
-                       f"{'✅ All servers healthy' if all_healthy else f'⚠️ {len(failed_servers)} server(s) failed health check'}")
+                       f"{' All servers healthy' if all_healthy else f' {len(failed_servers)} server(s) failed health check'}")
             await db.commit()
 
             # Trigger RCA for failed servers
@@ -807,7 +930,7 @@ async def _run_rca_agent(cr_id: int, server_hostname: str, error_message: str):
 
             # Create ServiceNow incident
             await _log(db, cr_id, run_id, "rca", "INFO",
-                       f"📋 Creating ServiceNow incident for {server_hostname}...", server=server_hostname)
+                       f" Creating ServiceNow incident for {server_hostname}...", server=server_hostname)
             await db.commit()
 
             incident_data = await servicenow_service.sn_client.create_incident(
@@ -830,14 +953,14 @@ async def _run_rca_agent(cr_id: int, server_hostname: str, error_message: str):
             await db.commit()
 
             await _log(db, cr_id, run_id, "rca", "INFO",
-                       f"✅ Incident created: {sn_number or 'N/A'}", server=server_hostname)
+                       f" Incident created: {sn_number or 'N/A'}", server=server_hostname)
 
             # Send failure email
             await email_service.send_failure_alert(server_hostname, cr.cr_number, error_message)
 
             # Run RCA analysis
             await _log(db, cr_id, run_id, "rca", "INFO",
-                       f"🤖 Running Gemini Pro RCA analysis...", server=server_hostname)
+                       f" Running Gemini Pro RCA analysis...", server=server_hostname)
             await db.commit()
 
             rca_result = await gemini_service.run_rca_analysis(
@@ -867,13 +990,13 @@ async def _run_rca_agent(cr_id: int, server_hostname: str, error_message: str):
             await db.commit()
 
             await _log(db, cr_id, run_id, "rca", "SUCCESS",
-                       f"✅ RCA complete for {server_hostname} — Root cause: {rca_result.get('root_cause', 'Unknown')}",
+                       f" RCA complete for {server_hostname} — Root cause: {rca_result.get('root_cause', 'Unknown')}",
                        server=server_hostname)
             await db.commit()
 
         except Exception as e:
             logger.error(f"RCA agent error: {e}", exc_info=True)
-            await _log(db, cr_id, run_id, "rca", "ERROR", f"❌ RCA error: {e}", server=server_hostname)
+            await _log(db, cr_id, run_id, "rca", "ERROR", f" RCA error: {e}", server=server_hostname)
             run.status = AgentRunStatus.failed
             run.error = str(e)
             await db.commit()

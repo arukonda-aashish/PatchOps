@@ -11,7 +11,8 @@ import { fmtDate, parseDays } from '@/lib/utils';
 import type { DependencyEdge, RebootWindow, ServicePauseConfig } from '@/types';
 import {
   BookOpen, Plus, Trash2, Brain, CheckCircle2, AlertTriangle,
-  ArrowRight, Clock, Server, Settings2, RefreshCw, ChevronRight
+  ArrowRight, Clock, Server, Settings2, RefreshCw, ChevronRight,
+  FileText, Eye, Wand2
 } from 'lucide-react';
 import { useState as useGraphState } from 'react';
 
@@ -625,10 +626,273 @@ function ServicePausesTab() {
   );
 }
 
+// ── Server KB Documents Tab ───────────────────────────────────────────────────
+function ServerKBTab() {
+  const [docs, setDocs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [editItem, setEditItem] = useState<any | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [previewDoc, setPreviewDoc] = useState<any | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+
+  const emptyForm = { server_hostname: '', document_content: '' };
+  const [form, setForm] = useState(emptyForm);
+
+ const load = () => {
+    fetch('/api/knowledge/server-kb', {
+      headers: { Authorization: `Bearer ${localStorage.getItem('patchops_token')}` },
+    })
+      .then((r) => r.json())
+      .then(setDocs)
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const token = localStorage.getItem('patchops_token');
+      if (editItem) {
+        await fetch(`/api/knowledge/server-kb/${editItem.id}`, {  
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ document_content: form.document_content }),
+        });
+      } else {
+        await fetch('/api/knowledge/server-kb', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(form),
+        });
+      }
+      setShowAdd(false);
+      setEditItem(null);
+      setForm(emptyForm);
+      load();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+ const handleDelete = async (id: number) => {
+    if (!confirm('Remove this KB document?')) return;
+    await fetch(`/api/knowledge/server-kb/${id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${localStorage.getItem('patchops_token')}` },
+    });
+    load();
+  };
+
+  const handlePreview = async (doc: any) => {
+    setPreviewing(true);
+    setPreviewDoc(doc);
+    try {
+      const token = localStorage.getItem('patchops_token');
+      const r = await fetch(`/api/knowledge/server-kb/${doc.id}/preview-scripts`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await r.json();
+      setPreviewDoc({ ...doc, ...data });
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const EXAMPLE_KB = `This server runs the UK production web tier.
+
+Applications running:
+- IIS (W3SVC): Main web server. Should be gracefully stopped before reboot by draining connections. After reboot, verify it starts and responds on port 80.
+- OrderProcessingService (Windows Service): Critical service that processes customer orders. Must be stopped gracefully — wait up to 60 seconds for in-flight orders to complete. After reboot, start it and wait 30 seconds before checking it is Running.
+- HealthMonitor (Windows Service): Lightweight monitoring agent. Can be stopped immediately. Will auto-start after reboot.
+
+Rules:
+- Never stop Windows Defender or any security software.
+- Never stop the WinRM service.
+- SQL Server is on a different machine — do not try to stop it here.
+- If OrderProcessingService fails to stop within 60 seconds, log a warning and proceed.`;
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-4">
+        <Btn variant="primary" size="sm" icon={<Plus size={13} />}
+          onClick={() => { setEditItem(null); setForm(emptyForm); setShowAdd(true); }}>
+          Add Server KB
+        </Btn>
+        <span className="ml-auto text-xs text-[#454C75]">{docs.length} servers configured</span>
+      </div>
+
+      {/* Info banner */}
+      <div className="mb-4 p-3 rounded-[8px] bg-indigo-500/8 border border-indigo-500/20 text-xs text-indigo-300 leading-relaxed">
+        <strong>How it works:</strong> Write a plain English description of the applications running on each server and any operational rules. Before each reboot, Gemini AI reads this document and generates a custom PowerShell script to gracefully stop and restart your applications. The generated scripts are streamed live in the execution log.
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center py-8"><Spinner /></div>
+      ) : docs.length === 0 ? (
+        <EmptyState
+          icon={<FileText size={20} />}
+          title="No server KB documents"
+          description="Add a knowledge base document for each server to enable AI-generated pre/post reboot scripts"
+        />
+      ) : (
+        <div className="flex flex-col gap-3">
+          {docs.map((doc) => (
+            <Card key={doc.id} className="p-4">
+              <div className="flex items-start justify-between gap-3 mb-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-7 h-7 rounded-[6px] bg-indigo-500/12 flex items-center justify-center">
+                    <Server size={12} className="text-indigo-400" />
+                  </div>
+                  <div>
+                    <div className="text-sm font-bold font-mono text-[#C4C8E8]">{doc.server_hostname}</div>
+                    {doc.last_script_generated_at && (
+                      <div className="text-[10px] text-[#454C75] mt-0.5">
+                        Scripts generated {new Date(doc.last_script_generated_at).toLocaleString()}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex gap-1 flex-shrink-0">
+                  <button
+                    onClick={() => handlePreview(doc)}
+                    className="flex items-center gap-1 px-2 h-6 rounded-[5px] bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 text-[10px] font-semibold transition-all"
+                    title="Preview AI-generated scripts"
+                  >
+                    <Wand2 size={10} />
+                    Preview Scripts
+                  </button>
+                  <button
+                    onClick={() => { setEditItem(doc); setForm({ server_hostname: doc.server_hostname, document_content: doc.document_content }); setShowAdd(true); }}
+                    className="w-6 h-6 rounded-[5px] bg-[#141828] flex items-center justify-center text-[#454C75] hover:text-[#C4C8E8] transition-all"
+                  >
+                    <Settings2 size={11} />
+                  </button>
+                  <button
+                    onClick={() => handleDelete(doc.id)}
+                    className="w-6 h-6 rounded-[5px] bg-red-500/10 flex items-center justify-center text-red-400 hover:bg-red-500/20 transition-all"
+                  >
+                    <Trash2 size={11} />
+                  </button>
+                </div>
+              </div>
+              <div className="text-xs text-[#8B91BE] leading-relaxed whitespace-pre-wrap bg-[#060810] rounded-[6px] p-3 border border-[#1C2038] max-h-24 overflow-hidden relative">
+                {doc.document_content}
+                <div className="absolute bottom-0 left-0 right-0 h-6 bg-gradient-to-t from-[#060810] to-transparent" />
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Add/Edit Modal */}
+      <Modal
+        open={showAdd}
+        onClose={() => { setShowAdd(false); setEditItem(null); }}
+        title={editItem ? `Edit KB: ${editItem.server_hostname}` : 'Add Server KB Document'}
+      >
+        <div className="flex flex-col gap-4">
+          {!editItem && (
+            <Input
+              label="Server Hostname"
+              placeholder="uk01pr1abat01"
+              value={form.server_hostname}
+              onChange={(e) => setForm(f => ({ ...f, server_hostname: e.target.value }))}
+            />
+          )}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-xs font-semibold text-[#8B91BE]">
+                Knowledge Base Document (plain English)
+              </label>
+              <button
+                className="text-[10px] text-indigo-400 hover:text-indigo-300"
+                onClick={() => setForm(f => ({ ...f, document_content: EXAMPLE_KB }))}
+              >
+                Load example
+              </button>
+            </div>
+            <Textarea
+              placeholder="Describe the applications running on this server and any rules for stopping/starting them before/after a reboot..."
+              value={form.document_content}
+              onChange={(e) => setForm(f => ({ ...f, document_content: e.target.value }))}
+              rows={12}
+            />
+            <p className="text-[10px] text-[#454C75] mt-1">
+              Write in plain English. Gemini will read this to generate safe PowerShell scripts.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <Btn variant="primary" onClick={handleSave} loading={saving} className="flex-1">
+              {editItem ? 'Save Changes' : 'Create KB Document'}
+            </Btn>
+            <Btn variant="secondary" onClick={() => { setShowAdd(false); setEditItem(null); }}>Cancel</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Preview Scripts Modal */}
+      <Modal
+        open={!!previewDoc}
+        onClose={() => setPreviewDoc(null)}
+        title={`AI-Generated Scripts: ${previewDoc?.server_hostname ?? ''}`}
+      >
+        {previewing ? (
+          <div className="flex flex-col items-center gap-3 py-8">
+            <Spinner />
+            <p className="text-sm text-[#8B91BE]">Gemini is reading the KB document and generating scripts...</p>
+          </div>
+        ) : previewDoc?.pre_reboot_script ? (
+          <div className="flex flex-col gap-4">
+            {previewDoc.apps_identified?.length > 0 && (
+              <div className="p-3 rounded-[8px] bg-emerald-500/8 border border-emerald-500/20">
+                <div className="text-[10px] text-emerald-400 font-semibold uppercase tracking-wider mb-1">Applications Identified</div>
+                <div className="flex flex-wrap gap-1">
+                  {previewDoc.apps_identified.map((app: string, i: number) => (
+                    <span key={i} className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-[10px] font-mono">{app}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {previewDoc.reasoning && (
+              <p className="text-xs text-[#8B91BE] leading-relaxed">{previewDoc.reasoning}</p>
+            )}
+            {previewDoc.warnings?.length > 0 && (
+              <div className="p-3 rounded-[8px] bg-yellow-500/8 border border-yellow-500/20">
+                <div className="text-[10px] text-yellow-400 font-semibold uppercase tracking-wider mb-1">Warnings</div>
+                {previewDoc.warnings.map((w: string, i: number) => (
+                  <p key={i} className="text-xs text-yellow-400">• {w}</p>
+                ))}
+              </div>
+            )}
+            <div>
+              <div className="text-[10px] text-[#454C75] font-semibold uppercase tracking-wider mb-2">Pre-Reboot Script</div>
+              <pre className="text-[10px] font-mono text-[#8B91BE] bg-[#060810] rounded-[6px] p-3 border border-[#1C2038] overflow-auto max-h-48 whitespace-pre-wrap">
+                {previewDoc.pre_reboot_script}
+              </pre>
+            </div>
+            <div>
+              <div className="text-[10px] text-[#454C75] font-semibold uppercase tracking-wider mb-2">Post-Reboot Script</div>
+              <pre className="text-[10px] font-mono text-[#8B91BE] bg-[#060810] rounded-[6px] p-3 border border-[#1C2038] overflow-auto max-h-48 whitespace-pre-wrap">
+                {previewDoc.post_reboot_script}
+              </pre>
+            </div>
+            <p className="text-[10px] text-[#454C75]">These scripts will be automatically executed during the next reboot operation for this server.</p>
+          </div>
+        ) : (
+          <p className="text-sm text-[#454C75] py-4 text-center">Click "Preview Scripts" to generate scripts from the KB document.</p>
+        )}
+      </Modal>
+    </div>
+  );
+}
+
 // ── Main Knowledge Base Page ──────────────────────────────────────────────────
 export function KnowledgeBasePage() {
   const { isAdmin } = useAuth();
-  const [tab, setTab] = useState<'deps' | 'windows' | 'pauses'>('deps');
+ const [tab, setTab] = useState<'deps' | 'windows' | 'pauses' | 'server-kb'>('deps');
 
   if (!isAdmin) return <Navigate to="/dashboard" replace />;
 
@@ -655,14 +919,16 @@ export function KnowledgeBasePage() {
           { id: 'deps', label: 'Dependency Graph' },
           { id: 'windows', label: 'Reboot Windows' },
           { id: 'pauses', label: 'Service Pauses' },
+          { id: 'server-kb', label: 'Server KB' },
         ]}
         active={tab}
-        onChange={(t) => setTab(t as 'deps' | 'windows' | 'pauses')}
+        onChange={(t) => setTab(t as 'deps' | 'windows' | 'pauses' | 'server-kb')}
       />
 
       {tab === 'deps' && <DepsTab />}
       {tab === 'windows' && <RebootWindowsTab />}
       {tab === 'pauses' && <ServicePausesTab />}
+      {tab === 'server-kb' && <ServerKBTab />}
     </Layout>
   );
 }

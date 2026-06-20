@@ -56,6 +56,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-patchops}:${POSTGRES_PASSWORD:-patchops_secret}@postgres:5432/${POSTGRES_DB:-patchops}
       REDIS_URL: redis://redis:6379/0
+      IS_CELERY_WORKER: "true"
     volumes:
       - ./backend:/app
       - ./config:/app/config:ro
@@ -78,6 +79,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-patchops}:${POSTGRES_PASSWORD:-patchops_secret}@postgres:5432/${POSTGRES_DB:-patchops}
       REDIS_URL: redis://redis:6379/0
+      IS_CELERY_WORKER: "true"
     volumes:
       - ./backend:/app
       - ./config:/app/config:ro

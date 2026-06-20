@@ -2,7 +2,7 @@
 from app.models.user import User
 from app.models.change_request import ChangeRequest, ServerTask
 from app.models.agent_run import AgentRun, AgentLog
-from app.models.knowledge import DependencyEdge, ScheduledRebootWindow, ServicePauseConfig
+from app.models.knowledge import DependencyEdge, ScheduledRebootWindow, ServicePauseConfig, ServerKBDocument
 from app.models.server import Server
 from app.models.incident import Incident
 

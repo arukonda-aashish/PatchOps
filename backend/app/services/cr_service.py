@@ -62,7 +62,7 @@ async def process_new_cr(payload) -> None:
                     cr_number=payload.cr_number,
                     title=payload.title or f"Change Request {payload.cr_number}",
                     description=payload.description,
-                    sn_sys_id=payload.sys_id,
+                    sn_sys_id=sn_sys_id,
                     priority=PRIORITY_MAP.get(
                         (payload.priority or "medium").lower(), CRPriority.medium
                     ),

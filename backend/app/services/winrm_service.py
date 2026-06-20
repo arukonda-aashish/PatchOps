@@ -23,19 +23,25 @@ async def execute_script(
     hostname: str,
     script_content: str,
     timeout: int = 60,
+    ip_address: str = None,
 ) -> WinRMResult:
-    """Execute a PowerShell script on a remote Windows server via WinRM"""
+    """Execute a PowerShell script on a remote Windows server via WinRM.
+    Uses ip_address for the actual connection if provided — hostname is used
+    for logging only. Azure VMs are reached by public IP, not hostname.
+    """
     if settings.WINRM_MOCK_MODE:
         return await _mock_execute(hostname, script_content)
 
-    # Real WinRM execution
+    # Use IP address if provided, otherwise fall back to hostname
+    connect_target = ip_address if ip_address else hostname
+
     try:
         import winrm
         protocol = "https" if settings.WINRM_USE_SSL else "http"
         session = winrm.Session(
-            f"{protocol}://{hostname}:{settings.WINRM_PORT}/wsman",
+            f"{protocol}://{connect_target}:{settings.WINRM_PORT}/wsman",
             auth=(settings.WINRM_USERNAME, settings.WINRM_PASSWORD),
-            transport="ntlm",
+            transport="basic",
             server_cert_validation="ignore",
         )
         result = session.run_ps(script_content)
@@ -55,7 +61,7 @@ async def execute_script(
         )
 
 
-async def get_server_state(hostname: str) -> dict:
+async def get_server_state(hostname: str, ip_address: str = None) -> dict:
     """Collect pre/post-reboot state metrics from a Windows server"""
     script = """
 $info = @{
@@ -72,7 +78,7 @@ $info = @{
 }
 $info | ConvertTo-Json
 """
-    result = await execute_script(hostname, script)
+    result = await execute_script(hostname, script, ip_address=ip_address)
     if result.success:
         import json
         try:
@@ -84,27 +90,28 @@ $info | ConvertTo-Json
     return _mock_server_state(hostname)
 
 
-async def initiate_reboot(hostname: str) -> WinRMResult:
+async def initiate_reboot(hostname: str, ip_address: str = None) -> WinRMResult:
     """Initiate graceful Windows reboot"""
-    script = "Restart-Computer -Force -Wait"
-    return await execute_script(hostname, script, timeout=settings.REBOOT_TIMEOUT_SECONDS)
+    script = "Restart-Computer -Force"
+    return await execute_script(hostname, script, timeout=settings.REBOOT_TIMEOUT_SECONDS, ip_address=ip_address)
 
 
-async def wait_for_reboot(hostname: str, timeout: int = 300) -> bool:
+async def wait_for_reboot(hostname: str, timeout: int = 300, ip_address: str = None) -> bool:
     """Poll until server is responsive again after reboot"""
     if settings.WINRM_MOCK_MODE:
         await asyncio.sleep(random.uniform(5, 12))
         return True
 
+    connect_target = ip_address if ip_address else hostname
     import winrm
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         try:
             protocol = "https" if settings.WINRM_USE_SSL else "http"
             session = winrm.Session(
-                f"{protocol}://{hostname}:{settings.WINRM_PORT}/wsman",
+                f"{protocol}://{connect_target}:{settings.WINRM_PORT}/wsman",
                 auth=(settings.WINRM_USERNAME, settings.WINRM_PASSWORD),
-                transport="ntlm",
+                transport="basic",
                 server_cert_validation="ignore",
             )
             result = session.run_ps("echo 'alive'")

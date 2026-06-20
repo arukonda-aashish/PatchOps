@@ -1,15 +1,19 @@
 """Async SQLAlchemy session factory"""
+import os
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
 
+_is_worker = os.getenv("IS_CELERY_WORKER", "false").lower() == "true"
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
+    **({} if _is_worker else {"pool_size": 10, "max_overflow": 20}),
+    poolclass=NullPool if _is_worker else None,
+    pool_pre_ping=not _is_worker,
 )
 
 AsyncSessionLocal = async_sessionmaker(

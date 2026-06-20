@@ -221,6 +221,18 @@ CREATE TABLE IF NOT EXISTS incidents (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS server_kb_documents (
+    id SERIAL PRIMARY KEY,
+    server_hostname VARCHAR(255) NOT NULL UNIQUE,
+    document_content TEXT NOT NULL,
+    last_pre_reboot_script TEXT,
+    last_post_reboot_script TEXT,
+    last_script_generated_at TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_by INTEGER REFERENCES users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
 -- =============================================================================
 -- SEED DATA

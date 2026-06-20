@@ -83,3 +83,35 @@ class ServicePauseConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+class ServerKBDocument(Base):
+    """
+    Per-server knowledge base document in plain English.
+    Describes applications running on the server, criticality rules,
+    and operational constraints. Gemini reads this to generate
+    custom pre/post reboot PowerShell scripts at execution time.
+    """
+    __tablename__ = "server_kb_documents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_hostname: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True
+    )
+    # Plain English document describing apps, rules, constraints
+    document_content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Last generated scripts (cached for audit/display)
+    last_pre_reboot_script: Mapped[str] = mapped_column(Text, nullable=True)
+    last_post_reboot_script: Mapped[str] = mapped_column(Text, nullable=True)
+    last_script_generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+

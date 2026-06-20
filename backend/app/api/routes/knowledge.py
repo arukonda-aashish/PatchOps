@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.db.session import get_db
 from app.models.knowledge import DependencyEdge, ScheduledRebootWindow, ServicePauseConfig
@@ -271,3 +271,149 @@ async def delete_service_pause(cid: int, db: AsyncSession = Depends(get_db)):
     c.is_active = False
     await db.commit()
     return {"status": "deleted"}
+
+
+class ServerKBDocumentCreate(BaseModel):
+    server_hostname: str
+    document_content: str
+
+
+class ServerKBDocumentUpdate(BaseModel):
+    document_content: str
+
+
+@router.get("/server-kb")
+async def list_server_kb(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    from app.models.knowledge import ServerKBDocument
+    result = await db.execute(
+        select(ServerKBDocument)
+        .where(ServerKBDocument.is_active == True)
+        .order_by(ServerKBDocument.server_hostname)
+    )
+    docs = result.scalars().all()
+    return [
+        {
+            "id": d.id,
+            "server_hostname": d.server_hostname,
+            "document_content": d.document_content,
+            "last_pre_reboot_script": d.last_pre_reboot_script,
+            "last_post_reboot_script": d.last_post_reboot_script,
+            "last_script_generated_at": d.last_script_generated_at.isoformat() if d.last_script_generated_at else None,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+            "updated_at": d.updated_at.isoformat() if d.updated_at else None,
+        }
+        for d in docs
+    ]
+
+
+@router.get("/server-kb/{hostname}")
+async def get_server_kb(
+    hostname: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    from app.models.knowledge import ServerKBDocument
+    result = await db.execute(
+        select(ServerKBDocument).where(
+            ServerKBDocument.server_hostname == hostname,
+            ServerKBDocument.is_active == True,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="No KB document for this server")
+    return {
+        "id": doc.id,
+        "server_hostname": doc.server_hostname,
+        "document_content": doc.document_content,
+        "last_pre_reboot_script": doc.last_pre_reboot_script,
+        "last_post_reboot_script": doc.last_post_reboot_script,
+        "last_script_generated_at": doc.last_script_generated_at.isoformat() if doc.last_script_generated_at else None,
+    }
+
+
+@router.post("/server-kb", dependencies=[Depends(require_admin)])
+async def create_server_kb(
+    body: ServerKBDocumentCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    from app.models.knowledge import ServerKBDocument
+    # Check for existing
+    result = await db.execute(
+        select(ServerKBDocument).where(ServerKBDocument.server_hostname == body.server_hostname)
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        existing.document_content = body.document_content
+        existing.is_active = True
+        existing.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+        return {"id": existing.id, "message": "KB document updated"}
+
+    doc = ServerKBDocument(
+        server_hostname=body.server_hostname,
+        document_content=body.document_content,
+        created_by=current_user.id,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+    return {"id": doc.id, "message": "KB document created"}
+
+
+@router.put("/server-kb/{doc_id}", dependencies=[Depends(require_admin)])
+async def update_server_kb(
+    doc_id: int,
+    body: ServerKBDocumentUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    from app.models.knowledge import ServerKBDocument
+    result = await db.execute(select(ServerKBDocument).where(ServerKBDocument.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    doc.document_content = body.document_content
+    doc.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"status": "updated"}
+
+
+@router.delete("/server-kb/{doc_id}", dependencies=[Depends(require_admin)])
+async def delete_server_kb(doc_id: int, db: AsyncSession = Depends(get_db)):
+    from app.models.knowledge import ServerKBDocument
+    result = await db.execute(select(ServerKBDocument).where(ServerKBDocument.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    doc.is_active = False
+    await db.commit()
+    return {"status": "deleted"}
+
+
+@router.post("/server-kb/{doc_id}/preview-scripts", dependencies=[Depends(require_admin)])
+async def preview_generated_scripts(
+    doc_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview the AI-generated pre/post reboot scripts without executing them"""
+    from app.models.knowledge import ServerKBDocument
+    from app.services.gemini_service import generate_reboot_scripts
+    result = await db.execute(select(ServerKBDocument).where(ServerKBDocument.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    scripts = await generate_reboot_scripts(
+        server_hostname=doc.server_hostname,
+        kb_document=doc.document_content,
+    )
+    # Cache the generated scripts
+    doc.last_pre_reboot_script = scripts["pre_reboot_script"]
+    doc.last_post_reboot_script = scripts["post_reboot_script"]
+    doc.last_script_generated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return scripts
